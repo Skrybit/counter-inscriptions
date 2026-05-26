@@ -6,10 +6,9 @@
     flake-utils.url = "github:numtide/flake-utils";
 
     # The patched counterparty-server (extra MIME types, 50 MB body limit).
-    # During local development before counterparty-core is pushed, override
-    # this on the command line with:
+    # During local development, override on the command line with:
     #   nix build --override-input counterparty-core path:../counterparty-core
-    counterparty-core.url = "github:Skrybit/counterparty-core/feat/nix-flake-packaging";
+    counterparty-core.url = "github:Skrybit/counterparty-core/nightly";
     counterparty-core.inputs.nixpkgs.follows = "nixpkgs";
     counterparty-core.inputs.flake-utils.follows = "flake-utils";
   };
