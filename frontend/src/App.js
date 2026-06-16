@@ -1,7 +1,12 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import axios from 'axios';
 
-const API_URL = process.env.REACT_APP_API_URL || 'http://localhost:3001/api';
+// Network-aware API bases. The unified UI is served by a Caddy that
+// path-routes /m/* → the mainnet backend and /t/* → the testnet backend
+// (same-origin, no CORS). The Network toggle selects which one each request
+// uses, so a single UI drives both cp-servers. Overridable at build time.
+const MAINNET_API = process.env.REACT_APP_MAINNET_API || '/m/api';
+const TESTNET_API = process.env.REACT_APP_TESTNET_API || '/t/api';
 const MAX_FILE_SIZE_MB = 50;
 const MAX_CHUNK_KB = 350;
 
@@ -137,10 +142,13 @@ export default function App() {
   const [showMimes, setShowMimes] = useState(false);
   const [health, setHealth] = useState(null);
 
-  // Health check on mount
+  // API base follows the Network toggle → the unified UI drives both backends.
+  const API_URL = network === 'testnet' ? TESTNET_API : MAINNET_API;
+
+  // Health check on mount and whenever the network changes.
   useEffect(() => {
     axios.get(`${API_URL}/health`).then(r => setHealth(r.data)).catch(() => setHealth({ status: 'degraded' }));
-  }, []);
+  }, [API_URL]);
 
   const connectWallet = async () => {
     setStatus({ type: 'info', msg: 'Connecting wallet...' });
