@@ -20,6 +20,7 @@ const MAX_CHUNK_BYTES = 350 * 1024;
 const app = express();
 app.use(cors());
 app.use('/api/', express.json({ limit: '100mb' }));
+app.use('/api/', express.urlencoded({ extended: true, limit: '100mb' }));
 
 // ─── Multer ───────────────────────────────────────────────────────────────────
 const upload = multer({
@@ -56,41 +57,97 @@ function detectMime(file) {
 }
 
 /**
- * POST one issuance to Counterparty exactly as mint_collection.sh does:
- *   asset=...&quantity=1&...&description=<hex>
- * We build the body as a raw Buffer to avoid any re-encoding of the hex payload.
+ * Normalize a Counterparty compose result (verbose=true) into the bundle the
+ * wallet needs. Taproot inscriptions are TWO transactions:
+ *   1. commit  — unsigned; the wallet signs `psbt` and broadcasts it
+ *   2. reveal  — `signed_reveal_rawtransaction`, already signed by the node with
+ *                an ephemeral key; broadcast it AFTER the commit (POST /api/broadcast)
+ * Without the reveal the inscription content never lands on-chain.
  */
-async function composeIssuance({ walletAddress, asset, mimeType, hexData, satPerVbyte = 2.01, encoding = 'taproot', quantity = 1 }) {
-  const prefix = [
-    `asset=${encodeURIComponent(asset)}`,
-    `quantity=${quantity}`,
-    `divisible=false`,
-    `encoding=${encoding}`,
-    `inscription=true`,
-    `mime_type=${encodeURIComponent(mimeType)}`,
-    `sat_per_vbyte=${satPerVbyte}`,
-    `description=`,
-  ].join('&');
+function normalizeCompose(result) {
+  const r = result?.result || result || {};
+  return {
+    psbt: r.psbt || null,                                   // base64 (bitcoind converttopsbt)
+    rawtransaction: r.rawtransaction || null,               // unsigned commit tx hex
+    signed_reveal_rawtransaction: r.signed_reveal_rawtransaction || null,
+    envelope_script: r.envelope_script || null,
+    input_count: Array.isArray(r.inputs_values) ? r.inputs_values.length : null,
+    btc_in: r.btc_in ?? null,
+    btc_out: r.btc_out ?? null,
+    btc_change: r.btc_change ?? null,
+    btc_fee: r.btc_fee ?? null,
+    signed_tx_estimated_size: r.signed_tx_estimated_size || null,
+    warnings: r.warnings || [],
+  };
+}
 
-  const body = Buffer.concat([
-    Buffer.from(prefix, 'utf8'),
-    Buffer.from(hexData, 'utf8'), // hex is pure ASCII — safe
-  ]);
+async function xcpCompose(source, kind, fields, { rawSuffix } = {}) {
+  const prefix = Object.entries({ ...fields, verbose: 'true' })
+    .filter(([, v]) => v !== undefined && v !== null && v !== '')
+    .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`)
+    .join('&');
+
+  // Large hex payloads are appended raw (hex is pure ASCII) to avoid re-encoding cost.
+  const body = rawSuffix
+    ? Buffer.concat([Buffer.from(`${prefix}&${rawSuffix.key}=`, 'utf8'), Buffer.from(rawSuffix.value, 'utf8')])
+    : Buffer.from(prefix, 'utf8');
 
   const response = await axios.post(
-    `${COUNTERPARTY_URL}/v2/addresses/${walletAddress}/compose/issuance`,
+    `${COUNTERPARTY_URL}/v2/addresses/${encodeURIComponent(source)}/compose/${kind}`,
     body,
     {
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Accept': 'application/json',
-      },
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' },
       maxBodyLength: Infinity,
       maxContentLength: Infinity,
       timeout: 180_000,
     }
   );
-  return response.data;
+  return normalizeCompose(response.data);
+}
+
+/**
+ * Compose one issuance. `source` is the CONNECTED wallet: it pays fees, signs the
+ * commit, and — per Counterparty issuance semantics — receives the issued units and
+ * the inscribed sat. `transferDestination` (optional) makes another address the
+ * asset OWNER (issuer); it does not move the units. Use a send/MPMA for that.
+ */
+async function composeIssuance({ source, asset, mimeType, hexData, satPerVbyte = 2.01, encoding = 'taproot', quantity = 1, transferDestination }) {
+  return xcpCompose(source, 'issuance', {
+    asset,
+    quantity,
+    divisible: 'false',
+    encoding,
+    inscription: 'true',
+    mime_type: mimeType,
+    sat_per_vbyte: satPerVbyte,
+    transfer_destination: transferDestination && transferDestination !== source ? transferDestination : undefined,
+  }, { rawSuffix: { key: 'description', value: hexData } });
+}
+
+/** Compose an MPMA send of `quantity` units of `asset` from `source` to each destination. */
+async function composeMpma({ source, asset, destinations, quantityEach = 1, satPerVbyte = 2.01 }) {
+  return xcpCompose(source, 'mpma', {
+    assets: destinations.map(() => asset).join(','),
+    destinations: destinations.join(','),
+    quantities: destinations.map(() => quantityEach).join(','),
+    sat_per_vbyte: satPerVbyte,
+  });
+}
+
+/** Returns the asset record if it already exists on Counterparty, else null. */
+async function lookupAsset(asset) {
+  try {
+    const r = await axios.get(`${COUNTERPARTY_URL}/v2/assets/${encodeURIComponent(asset)}`, { timeout: 10_000 });
+    return r.data?.result || null;
+  } catch (error) {
+    if (error.response?.status === 404) return null;
+    throw error;
+  }
+}
+
+function isValidAssetName(asset) {
+  // Numeric: A + 17..20 digits (Counterparty range is checked server-side). Named: 4–12 uppercase, not starting with A.
+  return /^A\d{17,20}$/.test(asset) || /^[B-Z][A-Z]{3,11}$/.test(asset);
 }
 
 function handleXcpError(res, error) {
@@ -143,106 +200,163 @@ window.onload = function() {
 </body></html>`);
 });
 
+/** Resolve file bytes + MIME from multipart `file` or legacy hex `description`. */
+function resolvePayload(req) {
+  const { mime_type } = req.body;
+  if (req.file) {
+    return { fileBuffer: req.file.buffer, resolvedMime: mime_type || detectMime(req.file) };
+  }
+  if (req.body.description) {
+    return { fileBuffer: Buffer.from(req.body.description, 'hex'), resolvedMime: mime_type || 'application/octet-stream' };
+  }
+  return null;
+}
+
+/**
+ * Chunk asset names must themselves be valid Counterparty asset names.
+ * Numeric assets: consecutive ids A<base>, A<base+1>, … (all free).
+ * Named assets cannot be chunked (there is no valid derived name and each would cost 0.5 XCP).
+ */
+function chunkAssetNames(asset, count) {
+  if (count === 1) return [asset];
+  if (!/^A\d{17,20}$/.test(asset)) {
+    const err = new Error('Files that need more than one chunk must use a numeric asset name (A…). Use the Auto button.');
+    err.clientStatus = 400;
+    throw err;
+  }
+  const base = BigInt(asset.slice(1));
+  const max = (1n << 64n) - 1n;
+  const names = [];
+  for (let i = 0n; i < BigInt(count); i++) {
+    const id = base + i;
+    if (id > max) {
+      const err = new Error('Numeric asset id overflows the Counterparty range when chunked — pick a lower number.');
+      err.clientStatus = 400;
+      throw err;
+    }
+    names.push(`A${id.toString()}`);
+  }
+  return names;
+}
+
+async function assertAssetsAvailable(names) {
+  for (const name of names) {
+    const existing = await lookupAsset(name);
+    if (existing) {
+      const err = new Error(`Asset ${name} already exists (issuer ${existing.issuer || 'unknown'}). Choose another name.`);
+      err.clientStatus = 409;
+      throw err;
+    }
+  }
+}
+
 /**
  * POST /api/mint
- * Single file → one wallet. Auto-chunks large files.
+ * Single file → issuance(s) signed by the connected wallet. Auto-chunks large files.
  * Accepts multipart/form-data (file field) OR application/x-www-form-urlencoded with hex in `description`.
+ *
+ * Counterparty issuance semantics: issued units and the inscribed sat go to `walletAddress`
+ * (the signer). `destinationWallet`, if different, becomes the asset OWNER via
+ * transfer_destination. To move the units use POST /api/send-batch after confirmation.
  */
 app.post('/api/mint', upload.single('file'), async (req, res) => {
   try {
     const {
       asset,
       quantity = 1,
-      mime_type,
       encoding = 'taproot',
       sat_per_vbyte = 2.01,
       walletAddress,
       destinationWallet,
     } = req.body;
 
-    const mintTo = destinationWallet?.trim() || walletAddress?.trim();
+    const source = walletAddress?.trim();
+    const owner = destinationWallet?.trim() || source;
 
-    if (!asset || !mintTo) {
+    if (!asset || !source) {
       return res.status(400).json({ error: 'Missing required: asset, walletAddress (and optionally destinationWallet)' });
     }
-
-    let fileBuffer, resolvedMime;
-    if (req.file) {
-      fileBuffer = req.file.buffer;
-      resolvedMime = mime_type || detectMime(req.file);
-    } else if (req.body.description) {
-      // Already hex-encoded (from legacy clients)
-      fileBuffer = Buffer.from(req.body.description, 'hex');
-      resolvedMime = mime_type || 'application/octet-stream';
-    } else {
-      return res.status(400).json({ error: 'No file or description payload provided' });
+    const assetName = String(asset).trim().toUpperCase();
+    if (!isValidAssetName(assetName)) {
+      return res.status(400).json({ error: `Invalid asset name "${assetName}". Use A + 17–20 digits (free) or 4–12 uppercase letters not starting with A (0.5 XCP).` });
     }
+    const qty = parseInt(quantity, 10);
+    if (!Number.isInteger(qty) || qty < 1) return res.status(400).json({ error: 'quantity must be a positive integer' });
+    const feeRate = parseFloat(sat_per_vbyte);
+    if (!(feeRate > 0)) return res.status(400).json({ error: 'sat_per_vbyte must be a positive number' });
+
+    const payload = resolvePayload(req);
+    if (!payload) return res.status(400).json({ error: 'No file or description payload provided' });
+    const { fileBuffer, resolvedMime } = payload;
 
     const chunks = chunkBuffer(fileBuffer, MAX_CHUNK_BYTES);
-    const transactions = [];
+    const names = chunkAssetNames(assetName, chunks.length);
+    await assertAssetsAvailable(names);
 
+    const transactions = [];
     for (let i = 0; i < chunks.length; i++) {
-      const hexData = bufToHex(chunks[i]);
-      const chunkAsset = chunks.length > 1 ? `${asset}_${i + 1}` : asset;
-      const data = await composeIssuance({
-        walletAddress: mintTo,
-        asset: chunkAsset,
+      const tx = await composeIssuance({
+        source,
+        asset: names[i],
         mimeType: resolvedMime,
-        hexData,
-        satPerVbyte: parseFloat(sat_per_vbyte),
+        hexData: bufToHex(chunks[i]),
+        satPerVbyte: feeRate,
         encoding,
-        quantity: parseInt(quantity),
+        quantity: qty,
+        transferDestination: owner !== source ? owner : undefined,
       });
-      transactions.push({ asset: chunkAsset, chunk: i + 1, total_chunks: chunks.length, data });
+      transactions.push({ asset: names[i], chunk: i + 1, total_chunks: chunks.length, chunk_bytes: chunks[i].length, tx });
     }
 
     return res.json({
       success: true,
-      asset,
-      wallet: mintTo,
+      asset: assetName,
+      chunk_assets: names,
+      signer: source,
+      holder: source,
+      owner,
       total_chunks: chunks.length,
       file_size_bytes: fileBuffer.length,
       mime_type: resolvedMime,
       transactions,
+      next_steps: [
+        'For each transaction: sign `tx.psbt` with the wallet and broadcast the commit.',
+        'Then POST /api/broadcast with `tx.signed_reveal_rawtransaction` — the inscription is not on-chain until the reveal confirms.',
+        owner !== source ? `Issued units stay with ${source}; ${owner} becomes the asset owner. Use POST /api/send-batch to move units.` : null,
+      ].filter(Boolean),
     });
   } catch (error) {
+    if (error.clientStatus) return res.status(error.clientStatus).json({ error: error.message });
     return handleXcpError(res, error);
   }
 });
 
 /**
  * POST /api/mint-batch
- * One file → multiple destination wallets (airdrop / collection drop).
- * File must fit in one chunk (<350KB). For larger files use /api/mint per wallet.
+ * One file → many wallets (airdrop). Composes ONE issuance of quantity = wallet count
+ * from the connected wallet. Distribute with POST /api/send-batch once it has confirmed.
+ * File must fit in one chunk (<350KB).
  */
 app.post('/api/mint-batch', upload.single('file'), async (req, res) => {
   try {
-    const {
-      asset,
-      mime_type,
-      encoding = 'taproot',
-      sat_per_vbyte = 2.01,
-      walletAddress,
-      destinationWallets,
-    } = req.body;
+    const { asset, encoding = 'taproot', sat_per_vbyte = 2.01, walletAddress, destinationWallets } = req.body;
+    const source = walletAddress?.trim();
 
-    if (!asset || !walletAddress || !destinationWallets) {
+    if (!asset || !source || !destinationWallets) {
       return res.status(400).json({ error: 'Missing required: asset, walletAddress, destinationWallets' });
     }
-
-    const wallets = destinationWallets.split(',').map(w => w.trim()).filter(Boolean);
-    if (wallets.length === 0) return res.status(400).json({ error: 'No valid wallet addresses' });
-
-    let fileBuffer, resolvedMime;
-    if (req.file) {
-      fileBuffer = req.file.buffer;
-      resolvedMime = mime_type || detectMime(req.file);
-    } else if (req.body.description) {
-      fileBuffer = Buffer.from(req.body.description, 'hex');
-      resolvedMime = mime_type || 'application/octet-stream';
-    } else {
-      return res.status(400).json({ error: 'No file or description payload provided' });
+    const assetName = String(asset).trim().toUpperCase();
+    if (!isValidAssetName(assetName)) {
+      return res.status(400).json({ error: `Invalid asset name "${assetName}".` });
     }
+    const wallets = [...new Set(destinationWallets.split(',').map(w => w.trim()).filter(Boolean))];
+    if (wallets.length === 0) return res.status(400).json({ error: 'No valid wallet addresses' });
+    const feeRate = parseFloat(sat_per_vbyte);
+    if (!(feeRate > 0)) return res.status(400).json({ error: 'sat_per_vbyte must be a positive number' });
+
+    const payload = resolvePayload(req);
+    if (!payload) return res.status(400).json({ error: 'No file or description payload provided' });
+    const { fileBuffer, resolvedMime } = payload;
 
     if (fileBuffer.length > MAX_CHUNK_BYTES) {
       return res.status(413).json({
@@ -251,28 +365,109 @@ app.post('/api/mint-batch', upload.single('file'), async (req, res) => {
       });
     }
 
-    const hexData = bufToHex(fileBuffer);
-    const results = [];
-    for (const dest of wallets) {
-      try {
-        const data = await composeIssuance({
-          walletAddress: dest,
-          asset,
-          mimeType: resolvedMime,
-          hexData,
-          satPerVbyte: parseFloat(sat_per_vbyte),
-          encoding,
-          quantity: 1,
-        });
-        results.push({ wallet: dest, status: 'success', data });
-      } catch (err) {
-        const errMsg = err.response?.data || err.message;
-        results.push({ wallet: dest, status: 'failed', error: typeof errMsg === 'object' ? JSON.stringify(errMsg) : errMsg });
-      }
-    }
+    await assertAssetsAvailable([assetName]);
 
-    const succeeded = results.filter(r => r.status === 'success').length;
-    return res.json({ success: true, total: wallets.length, succeeded, failed: wallets.length - succeeded, results });
+    const tx = await composeIssuance({
+      source,
+      asset: assetName,
+      mimeType: resolvedMime,
+      hexData: bufToHex(fileBuffer),
+      satPerVbyte: feeRate,
+      encoding,
+      quantity: wallets.length,
+    });
+
+    return res.json({
+      success: true,
+      asset: assetName,
+      signer: source,
+      quantity: wallets.length,
+      destinations: wallets,
+      mime_type: resolvedMime,
+      file_size_bytes: fileBuffer.length,
+      tx,
+      next_steps: [
+        'Sign `tx.psbt`, broadcast the commit, then POST /api/broadcast with `tx.signed_reveal_rawtransaction`.',
+        `Once the issuance has confirmed, POST /api/send-batch with the same asset and destinations to airdrop one unit to each of the ${wallets.length} wallets in a single MPMA transaction.`,
+      ],
+    });
+  } catch (error) {
+    if (error.clientStatus) return res.status(error.clientStatus).json({ error: error.message });
+    return handleXcpError(res, error);
+  }
+});
+
+/**
+ * POST /api/send-batch  (JSON or form)
+ * { walletAddress, asset, destinationWallets: "a,b,c" | [..], quantity_each?: 1, sat_per_vbyte? }
+ * Composes one MPMA send from the connected wallet. The asset must already be confirmed
+ * and held by walletAddress, otherwise Counterparty reports insufficient funds.
+ */
+app.post('/api/send-batch', upload.none(), async (req, res) => {
+  try {
+    const { walletAddress, asset, destinationWallets, quantity_each = 1, sat_per_vbyte = 2.01 } = req.body;
+    const source = walletAddress?.trim();
+    if (!source || !asset || !destinationWallets) {
+      return res.status(400).json({ error: 'Missing required: walletAddress, asset, destinationWallets' });
+    }
+    const list = Array.isArray(destinationWallets) ? destinationWallets : String(destinationWallets).split(',');
+    const wallets = [...new Set(list.map(w => String(w).trim()).filter(Boolean))];
+    if (wallets.length === 0) return res.status(400).json({ error: 'No valid wallet addresses' });
+    const qtyEach = parseInt(quantity_each, 10);
+    if (!Number.isInteger(qtyEach) || qtyEach < 1) return res.status(400).json({ error: 'quantity_each must be a positive integer' });
+
+    const tx = await composeMpma({
+      source,
+      asset: String(asset).trim().toUpperCase(),
+      destinations: wallets,
+      quantityEach: qtyEach,
+      satPerVbyte: parseFloat(sat_per_vbyte),
+    });
+    return res.json({ success: true, asset: String(asset).trim().toUpperCase(), signer: source, destinations: wallets, quantity_each: qtyEach, tx });
+  } catch (error) {
+    return handleXcpError(res, error);
+  }
+});
+
+/**
+ * POST /api/broadcast  { signedhex }
+ * Proxies to Counterparty's bitcoind sendrawtransaction. Used for the reveal transaction
+ * (already signed by the node) and for wallets that cannot push raw hex themselves.
+ */
+app.post('/api/broadcast', upload.none(), async (req, res) => {
+  try {
+    const signedhex = (req.body.signedhex || req.body.rawtx || '').trim();
+    if (!/^[0-9a-fA-F]+$/.test(signedhex) || signedhex.length < 20) {
+      return res.status(400).json({ error: 'signedhex must be a hex-encoded signed transaction' });
+    }
+    const r = await axios.post(
+      `${COUNTERPARTY_URL}/v2/bitcoin/transactions`,
+      `signedhex=${signedhex}`,
+      { headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' }, timeout: 30_000 }
+    );
+    return res.json({ success: true, txid: r.data?.result ?? r.data });
+  } catch (error) {
+    return handleXcpError(res, error);
+  }
+});
+
+/** GET /api/tx/:hash — Counterparty view of a transaction (null result until it is parsed). */
+app.get('/api/tx/:hash', async (req, res) => {
+  try {
+    const r = await axios.get(`${COUNTERPARTY_URL}/v2/transactions/${encodeURIComponent(req.params.hash)}`, { timeout: 10_000 });
+    return res.json(r.data);
+  } catch (error) {
+    if (error.response?.status === 404) return res.json({ result: null });
+    return handleXcpError(res, error);
+  }
+});
+
+/** GET /api/asset/:asset — availability check. */
+app.get('/api/asset/:asset', async (req, res) => {
+  try {
+    const name = req.params.asset.toUpperCase();
+    const existing = await lookupAsset(name);
+    return res.json({ asset: name, available: !existing, valid: isValidAssetName(name), existing });
   } catch (error) {
     return handleXcpError(res, error);
   }
@@ -301,7 +496,7 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
 /** GET /api/balance/:address */
 app.get('/api/balance/:address', async (req, res) => {
   try {
-    const r = await axios.get(`${COUNTERPARTY_URL}/v2/addresses/${req.params.address}/balances`, { timeout: 10_000 });
+    const r = await axios.get(`${COUNTERPARTY_URL}/v2/addresses/${encodeURIComponent(req.params.address)}/balances`, { timeout: 10_000 });
     return res.json(r.data);
   } catch (error) {
     return res.status(500).json({ error: 'Failed to fetch balance', details: error.message });
@@ -312,7 +507,7 @@ app.get('/api/balance/:address', async (req, res) => {
 app.get('/api/health', async (req, res) => {
   try {
     const r = await axios.get(`${COUNTERPARTY_URL}/v2/`, { timeout: 5_000 });
-    return res.json({ status: 'ok', counterparty: 'reachable', counterparty_url: COUNTERPARTY_URL, version: r.data?.version });
+    return res.json({ status: 'ok', counterparty: 'reachable', counterparty_url: COUNTERPARTY_URL, version: r.data?.result?.version || r.data?.version });
   } catch (error) {
     return res.json({ status: 'degraded', counterparty: 'unreachable', counterparty_url: COUNTERPARTY_URL, error: error.message });
   }
@@ -353,7 +548,7 @@ app.get('/', (req, res) => res.redirect('/swagger-ui.html'));
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, '0.0.0.0', () => {
+if (require.main === module) app.listen(PORT, '0.0.0.0', () => {
   console.log(`✓ Backend running on http://0.0.0.0:${PORT}`);
   console.log(`✓ Swagger UI: http://localhost:${PORT}/swagger-ui.html`);
   console.log(`✓ Counterparty URL: ${COUNTERPARTY_URL}`);

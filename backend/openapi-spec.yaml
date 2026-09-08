@@ -1,419 +1,369 @@
 openapi: 3.0.3
 info:
-  title: Counter-Inscriptions Minting API
+  title: Counter-Inscriptions Minter API
+  version: 2.0.0
   description: |
-    ## Counter-Inscription Minting API
+    Mint any MIME type as an Ordinals inscription via the Counterparty protocol (taproot encoding).
 
-    This API allows minting counter-inscriptions on the Counter-Inscriptions Network (Bitcoin L2 sidechain).
+    ## Two transactions per inscription
+    A Counterparty taproot inscription is a **commit** transaction plus a **reveal** transaction:
 
-    ## Key Concepts
+    1. `tx.psbt` — the unsigned commit as a base64 PSBT. The connected wallet signs and broadcasts it.
+    2. `tx.signed_reveal_rawtransaction` — the reveal, already signed by the Counterparty node with an
+       ephemeral key. Broadcast it with `POST /api/broadcast` **after** the commit. The inscription content
+       is not on-chain until the reveal confirms.
 
-    - **Counter-Inscriptions**: Named digital assets minted on Bitcoin using Taproot Ordinals protocol
-    - **Minting**: Creating new named tokens that can be transferred like Bitcoin
-    - **Inscription**: Each mint creates an on-chain inscription with metadata (name, description, MIME type)
+    ## Who receives what
+    Counterparty issuance semantics: the **signer** (`walletAddress`) pays fees, receives the issued units and
+    the inscribed sat. `destinationWallet` only transfers asset *ownership* (`transfer_destination`). To move
+    units to other wallets use `POST /api/send-batch` (one MPMA transaction) once the issuance has confirmed.
 
-    ## Rate Limits
-    The Counterparty server enforces block-level rate limits based on current network conditions. Large files may require lower saturation percentages or higher fees.
-
-    ## Block Fee Structure
-    Current typical fee: 0.00125 XCP (~$0.40 USD depending on BTC price)
-
-  version: 1.0.0
-
+    ## Chunking
+    Files larger than 350KB are split into consecutive numeric assets (`A<n>`, `A<n+1>`, …), one commit/reveal
+    pair each. Named assets cannot be chunked. Reassembly is done by the viewer.
 servers:
   - url: http://localhost:3001/api
     description: Local development server
+  - url: /api
+    description: Same origin (nginx proxy in Docker)
 
 tags:
   - name: Minting
-    description: Operations for minting new counter-inscriptions
+  - name: Broadcast
+  - name: Lookup
+
+components:
+  schemas:
+    ComposedTx:
+      type: object
+      description: Normalised Counterparty compose result (`verbose=true`).
+      properties:
+        psbt:
+          type: string
+          nullable: true
+          description: Base64 PSBT of the unsigned commit (or send) transaction. Sign this in the wallet.
+          example: "cHNidP8BAH0CAAAAAX..."
+        rawtransaction:
+          type: string
+          description: Unsigned commit transaction hex (informational; wallets need the PSBT).
+        signed_reveal_rawtransaction:
+          type: string
+          nullable: true
+          description: Node-signed reveal transaction hex. Present for taproot inscriptions. Broadcast after the commit.
+        envelope_script:
+          type: string
+          nullable: true
+          description: Hex of the ord envelope tapscript embedded in the reveal.
+        input_count:
+          type: integer
+          nullable: true
+          description: Number of inputs in the commit. Wallets use it to know which inputs to sign.
+        btc_in: { type: integer, description: Satoshis consumed }
+        btc_out: { type: integer, description: Satoshis sent to outputs (incl. the commit output funding the reveal) }
+        btc_change: { type: integer }
+        btc_fee: { type: integer, description: Commit fee in satoshis. The reveal fee is prefunded inside btc_out. }
+        signed_tx_estimated_size:
+          type: object
+          properties:
+            vsize: { type: integer }
+            adjusted_vsize: { type: integer }
+            sigops_count: { type: integer }
+        warnings:
+          type: array
+          items: { type: string }
+    Error:
+      type: object
+      properties:
+        error: { type: string }
+        details: { type: string }
+        hint: { type: string }
 
 paths:
   /mint:
     post:
-      summary: Mint a new counter-inscription
       tags: [Minting]
+      summary: Compose inscription issuance(s) for the connected wallet (auto-chunks large files)
       requestBody:
         required: true
         content:
-          application/x-www-form-urlencoded:
+          multipart/form-data:
             schema:
               type: object
-              required:
-                - asset
-                - description
-                - mime_type
-                - walletAddress
-                - encoding
+              required: [file, asset, walletAddress]
               properties:
+                file:
+                  type: string
+                  format: binary
+                  description: File to inscribe (max 50MB). Chunked above 350KB.
                 asset:
                   type: string
-                  example: "digital-gold"
-                  description: Name of the minted asset (must be unique)
-                quantity:
-                  type: string
-                  example: "1"
-                  description: Number of copies to mint (must be 1 for non-divisible assets)
-                divisible:
-                  type: string
-                  example: "false"
-                  description: Whether the asset is divisible (always false for counter-inscriptions)
-                description:
-                  type: string
-                  example: "Premium golden token representing digital wealth"
-                  description: UTF-8 encoded description of the asset
-                mime_type:
-                  type: string
-                  example: "image/png"
-                  description: MIME type of the counter-inscription content
-                encoding:
-                  type: string
-                  enum: [taproot, bech32]
-                  default: taproot
-                  example: "taproot"
-                  description: BIP84 wallet encoding (Taproot is recommended)
-                sat_per_vbyte:
-                  type: number
-                  example: 2.01
-                  description: Fee rate in sat/vbyte for transaction
+                  example: "A1000000000000000000"
+                  description: Numeric `A` + 17–20 digits (free) or 4–12 uppercase letters not starting with A (0.5 XCP).
                 walletAddress:
                   type: string
-                  example: "bcrt1...xyz"
-                  description: Bitcoin wallet address to receive the mint
-                inscription:
+                  description: Connected wallet. Signs the commit, pays fees, receives the units and the inscribed sat.
+                destinationWallet:
                   type: string
-                  example: "true"
-                  description: Whether this is an ordinal inscription (always true)
-
-      responses:
-        '200':
-          description: Successful mint operation
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  success:
-                    type: boolean
-                    example: true
-                  raw_tx:
-                    type: string
-                    example: "01000000..."
-                    description: Hex-encoded unsigned transaction
-                  asset:
-                    type: string
-                    example: "digital-gold"
-                  wallet:
-                    type: string
-                    example: "bcrt1...xyz"
-        '400':
-          description: Missing required fields
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  error:
-                    type: string
-        '402':
-          description: Insufficient funds for fees and registration cost
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  error:
-                    type: string
-                  details:
-                    type: string
-        '503':
-          description: Counterparty server unreachable
-
-  /mint-any-wallet:
-    post:
-      summary: Mint to any specified wallet address (not just connected)
-      description: |
-        Mints a counter-inscription to a specific wallet address.
-        The connected wallet pays fees, but the asset goes to the specified destination.
-      tags: [Minting]
-      requestBody:
-        required: true
-        content:
-          application/x-www-form-urlencoded:
-            schema:
-              type: object
-              required:
-                - asset
-                - description
-                - mime_type
-              properties:
-                asset:
+                  description: Optional. Becomes the asset owner via `transfer_destination`. Does NOT receive the units.
+                mime_type:
                   type: string
-                  example: "golden-token"
+                  description: Override auto-detected MIME type.
                 quantity:
-                  type: string
-                  example: "1"
-                divisible:
-                  type: string
-                  example: "false"
-                description:
-                  type: string
-                  example: "Exclusive golden token for premium users"
-                mime_type:
-                  type: string
-                  example: "image/png"
-                encoding:
-                  type: string
-                  enum: [taproot, bech32]
-                  default: taproot
-                  example: "taproot"
+                  type: integer
+                  default: 1
                 sat_per_vbyte:
                   type: number
-                  example: 2.01
-                walletAddress:
+                  default: 2.01
+                encoding:
                   type: string
-                  example: "bcrt1...xyz"
-
-      responses:
-        '200':
-          description: Successful mint operation
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  success:
-                    type: boolean
-                    example: true
-                  raw_tx:
-                    type: string
-                    example: "01000000..."
-                  asset:
-                    type: string
-                    example: "golden-token"
-                  wallet:
-                    type: string
-                    example: "bcrt1...xyz"
-
-  /mint-collection:
-    post:
-      summary: Batch mint collection to multiple wallets
-      description: |
-        Mints the same counter-inscription to a batch of wallets.
-        Each wallet receives one copy with their own unique transaction.
-      tags: [Minting]
-      requestBody:
-        required: true
-        content:
+                  enum: [taproot]
+                  default: taproot
           application/x-www-form-urlencoded:
             schema:
               type: object
-              required:
-                - asset
-                - description
-                - mime_type
-                - walletAddresses
+              required: [asset, walletAddress, description]
               properties:
-                asset:
-                  type: string
-                  example: "digital-gold"
-                quantity_per_wallet:
-                  type: string
-                  example: "1"
-                divisible:
-                  type: string
-                  example: "false"
-                description:
-                  type: string
-                  example: "Premium golden token collection"
-                mime_type:
-                  type: string
-                  example: "image/png"
-                encoding:
-                  type: string
-                  enum: [taproot, bech32]
-                  default: taproot
-                  example: "taproot"
-                sat_per_vbyte:
-                  type: number
-                  example: 2.01
-                walletAddresses:
-                  type: string
-                  description: Comma-separated list of wallet addresses
-                  example: "bcrt1...aaa,bcrt1...bbb,bcrt1...ccc"
-
+                asset: { type: string }
+                walletAddress: { type: string }
+                description: { type: string, description: Hex-encoded content (legacy clients) }
+                mime_type: { type: string }
+                sat_per_vbyte: { type: number }
       responses:
         '200':
-          description: Batch mint operation results
+          description: Composed transactions, one per chunk
           content:
             application/json:
               schema:
                 type: object
                 properties:
-                  success:
-                    type: boolean
-                    example: true
-                  total:
-                    type: integer
-                    example: 3
-                  succeeded:
-                    type: integer
-                    example: 3
+                  success: { type: boolean }
+                  asset: { type: string }
+                  chunk_assets:
+                    type: array
+                    items: { type: string }
+                  signer: { type: string }
+                  holder: { type: string, description: Address that will hold the issued units (= signer) }
+                  owner: { type: string, description: Asset owner after issuance }
+                  total_chunks: { type: integer }
+                  file_size_bytes: { type: integer }
+                  mime_type: { type: string }
                   transactions:
                     type: array
                     items:
                       type: object
                       properties:
-                        wallet:
-                          type: string
-                        raw_tx:
-                          type: string
-                        status:
-                          type: string
-                          enum: [success, failed]
-                        error:
-                          type: string
-                  message:
-                    type: string
-                    example: "3/3 mint operations completed"
-        '400':
-          description: Invalid wallet addresses provided
+                        asset: { type: string }
+                        chunk: { type: integer }
+                        total_chunks: { type: integer }
+                        chunk_bytes: { type: integer }
+                        tx: { $ref: '#/components/schemas/ComposedTx' }
+                  next_steps:
+                    type: array
+                    items: { type: string }
+        '400': { description: Missing/invalid fields or a named asset that would need chunking, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '402': { description: Insufficient funds, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '409': { description: Asset name already exists, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '422': { description: Unsupported MIME type, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '503': { description: Counterparty server unreachable }
 
-  /balance/{address}:
-    get:
-      summary: Get balance for a wallet address
-      description: Returns all asset balances for the specified Bitcoin address
-      tags: [Wallet]
-      parameters:
-        - name: address
-          in: path
-          required: true
-          schema:
-            type: string
-            example: "bcrt1...xyz"
-          description: Bitcoin wallet address
+  /mint-batch:
+    post:
+      tags: [Minting]
+      summary: Airdrop step 1 — one issuance of quantity = number of wallets
+      description: |
+        Composes a single inscription issuance from `walletAddress` with `quantity` equal to the number of
+        distinct `destinationWallets`. After it confirms, call `/send-batch` to deliver one unit to each wallet.
+        File must be ≤350KB.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file, asset, walletAddress, destinationWallets]
+              properties:
+                file: { type: string, format: binary }
+                asset: { type: string }
+                walletAddress: { type: string }
+                destinationWallets: { type: string, description: Comma-separated addresses, example: "bc1p…,bc1p…" }
+                mime_type: { type: string }
+                sat_per_vbyte: { type: number, default: 2.01 }
       responses:
         '200':
-          description: Balance information
+          description: Composed issuance
           content:
             application/json:
               schema:
                 type: object
-                additionalProperties:
-                  type: object
-                  properties:
-                    value:
-                      type: string
-                    asset:
-                      type: string
-        '500':
-          description: Failed to fetch balance
+                properties:
+                  success: { type: boolean }
+                  asset: { type: string }
+                  signer: { type: string }
+                  quantity: { type: integer }
+                  destinations: { type: array, items: { type: string } }
+                  mime_type: { type: string }
+                  file_size_bytes: { type: integer }
+                  tx: { $ref: '#/components/schemas/ComposedTx' }
+                  next_steps: { type: array, items: { type: string } }
+        '400': { description: Missing fields }
+        '409': { description: Asset name already exists }
+        '413': { description: File too large for a single chunk }
 
-  /generate-asset-name:
+  /send-batch:
     post:
-      summary: Generate a free asset name automatically
-      description: Generates a unique name for your counter-inscription using timestamp and random suffix
       tags: [Minting]
+      summary: Airdrop step 2 — one MPMA send to many wallets
+      description: The asset must be confirmed and held by `walletAddress`; otherwise Counterparty reports insufficient funds.
       requestBody:
+        required: true
         content:
           application/json:
             schema:
               type: object
+              required: [walletAddress, asset, destinationWallets]
               properties:
-                prefix:
-                  type: string
-                  example: "gold"
-                  description: Optional prefix for the generated name
+                walletAddress: { type: string }
+                asset: { type: string }
+                destinationWallets:
+                  oneOf:
+                    - { type: array, items: { type: string } }
+                    - { type: string, description: Comma-separated }
+                quantity_each: { type: integer, default: 1 }
+                sat_per_vbyte: { type: number, default: 2.01 }
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                walletAddress: { type: string }
+                asset: { type: string }
+                destinationWallets: { type: string }
       responses:
         '200':
-          description: Generated asset name
+          description: Composed MPMA send (no reveal — sign `tx.psbt` and broadcast)
           content:
             application/json:
               schema:
                 type: object
                 properties:
-                  asset:
-                    type: string
-                    example: "gold1705329123847"
+                  success: { type: boolean }
+                  asset: { type: string }
+                  signer: { type: string }
+                  destinations: { type: array, items: { type: string } }
+                  quantity_each: { type: integer }
+                  tx: { $ref: '#/components/schemas/ComposedTx' }
+        '402': { description: Insufficient funds (issuance not yet confirmed?) }
+
+  /broadcast:
+    post:
+      tags: [Broadcast]
+      summary: Broadcast a signed transaction hex (use for the reveal)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [signedhex]
+              properties:
+                signedhex: { type: string, description: Signed transaction hex }
+      responses:
+        '200':
+          description: Broadcast accepted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  txid: { type: string }
+        '400': { description: Not a hex transaction }
+        '500': { description: Node rejected the transaction (details in `error`) }
+
+  /upload:
+    post:
+      tags: [Lookup]
+      summary: Pre-flight analysis — MIME, size, chunk count, hex preview
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: { type: string, format: binary }
+      responses:
+        '200':
+          description: Analysis
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  originalName: { type: string }
+                  mimeType: { type: string }
+                  sizeBytes: { type: integer }
+                  totalChunks: { type: integer }
+                  needsChunking: { type: boolean }
+                  hexPreview: { type: string }
+
+  /asset/{asset}:
+    get:
+      tags: [Lookup]
+      summary: Check whether an asset name is valid and still available
+      parameters:
+        - { name: asset, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Availability
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  asset: { type: string }
+                  valid: { type: boolean }
+                  available: { type: boolean }
+                  existing: { type: object, nullable: true }
+
+  /tx/{hash}:
+    get:
+      tags: [Lookup]
+      summary: Counterparty view of a transaction (`result` is null until parsed)
+      parameters:
+        - { name: hash, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: Counterparty transaction record or null }
+
+  /balance/{address}:
+    get:
+      tags: [Lookup]
+      summary: Counterparty balances for an address
+      parameters:
+        - { name: address, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: "Proxied /v2/addresses/{address}/balances" }
+
+  /mime-types:
+    get:
+      tags: [Lookup]
+      summary: Supported MIME types, chunk size and file size limits
+      responses:
+        '200': { description: Lists }
 
   /health:
     get:
-      summary: Health check endpoint
-      description: Verifies the Counterparty server is reachable
-      tags: [System]
+      tags: [Lookup]
+      summary: Backend status and Counterparty reachability
       responses:
         '200':
-          description: Server is healthy
+          description: Status
           content:
             application/json:
               schema:
                 type: object
                 properties:
-                  status:
-                    type: string
-                    enum: [ok, offline, error]
-                    example: ok
-                  counterparty_url:
-                    type: string
-                    example: http://localhost:4000
-
-components:
-  schemas:
-    MintRequest:
-      type: object
-      required:
-        - asset
-        - description
-        - mime_type
-        - walletAddress
-      properties:
-        asset:
-          type: string
-        quantity:
-          type: string
-          default: "1"
-        divisible:
-          type: string
-          default: "false"
-        description:
-          type: string
-        mime_type:
-          type: string
-        encoding:
-          type: string
-          enum: [taproot, bech32]
-          default: taproot
-        sat_per_vbyte:
-          type: number
-          default: 2.01
-        walletAddress:
-          type: string
-    BatchMintRequest:
-      type: object
-      required:
-        - asset
-        - description
-        - mime_type
-        - walletAddresses
-      properties:
-        asset:
-          type: string
-        quantity_per_wallet:
-          type: string
-          default: "1"
-        divisible:
-          type: string
-          default: "false"
-        description:
-          type: string
-        mime_type:
-          type: string
-        encoding:
-          type: string
-          enum: [taproot, bech32]
-          default: taproot
-        sat_per_vbyte:
-          type: number
-          default: 2.01
-        walletAddresses:
-          type: string
+                  status: { type: string, enum: [ok, degraded] }
+                  counterparty: { type: string }
+                  counterparty_url: { type: string }
+                  version: { type: string }
