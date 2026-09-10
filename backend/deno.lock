@@ -1,0 +1,38 @@
+{
+  "version": "4",
+  "specifiers": {
+    "jsr:@std/encoding@^1.0.10": "1.0.11",
+    "jsr:@std/internal@^1.0.14": "1.0.14",
+    "jsr:@std/media-types@^1.1.0": "1.1.0",
+    "jsr:@std/path@^1.1.2": "1.1.6",
+    "jsr:@std/yaml@^1.0.9": "1.2.0"
+  },
+  "jsr": {
+    "@std/encoding@1.0.11": {
+      "integrity": "e7cef2f0b3153bccc17431e7c864a1de03a4b6d9647389c43e08aaa775d37385"
+    },
+    "@std/internal@1.0.14": {
+      "integrity": "291516b3d4c35024d6ffbc0a9df5bf4c64116e05b50012cf846710152d2ffdf7"
+    },
+    "@std/media-types@1.1.0": {
+      "integrity": "c9d093f0c05c3512932b330e3cc1fe1d627b301db33a4c2c2185c02471d6eaa4"
+    },
+    "@std/path@1.1.6": {
+      "integrity": "c68485c2a4dfbb5ae3cc74fae4e8c4e5d874cf8a8ed12927917235c758b46cbe",
+      "dependencies": [
+        "jsr:@std/internal"
+      ]
+    },
+    "@std/yaml@1.2.0": {
+      "integrity": "20beb41e4983ba3437dbefac62b14061ab058e8a187596f19d28ff9035f6e6cf"
+    }
+  },
+  "workspace": {
+    "dependencies": [
+      "jsr:@std/encoding@^1.0.10",
+      "jsr:@std/media-types@^1.1.0",
+      "jsr:@std/path@^1.1.2",
+      "jsr:@std/yaml@^1.0.9"
+    ]
+  }
+}

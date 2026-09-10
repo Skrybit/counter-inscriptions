@@ -1,15 +1,15 @@
-FROM node:18-alpine
+# Counter-Inscriptions backend — Deno (INFRA-281 / ADR-049).
+# Deps are vendored under vendor/ and pinned in deno.lock, so the image
+# builds and runs fully offline (no registry access, no node_modules).
+FROM denoland/deno:2.2.12
 
 WORKDIR /app
-
-COPY package*.json ./
-RUN npm install --silent
-
 COPY . .
-# Copy frontend build for SPA fallback serving
-# No COPY of frontend build - using volume mount instead
-# This line will be removed since we use volume in docker-compose.yml
+
+# Warm the transpile cache at build time (deps resolve from vendor/).
+RUN deno cache --cached-only index.ts
 
 EXPOSE 3001
 
-CMD ["node", "index.js"]
+# The base image's ENTRYPOINT is `deno`; these are its arguments.
+CMD ["run", "--cached-only", "--allow-net", "--allow-read", "--allow-env", "index.ts"]

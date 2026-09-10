@@ -18,35 +18,54 @@
       let
         pkgs = nixpkgs.legacyPackages.${system};
 
-        # ── Node.js backend (port 3001) ──
-        # Express + PSBT composition + wallet integration. Talks to a local
-        # counterparty-server over HTTP.
-        backend = pkgs.buildNpmPackage {
+        # ── Deno backend (port 3001) — INFRA-281 / ADR-049 ──
+        # Ported from Express/Node to Deno-native (Deno.serve + Request.formData
+        # + fetch + @std). Dependencies are the jsr @std libs only, vendored
+        # under backend/vendor/ and pinned in deno.lock — so both the build and
+        # the runtime resolve fully offline (no npmDepsHash, no network, no
+        # node_modules). cp-server dependency is unaffected.
+        backend = pkgs.stdenvNoCC.mkDerivation {
           pname = "counter-inscriptions-backend";
           version = "1.0.0";
           src = ./backend;
 
-          npmDepsHash = "sha256-7v0BvjbwA64PW/9h5/U5uT8vNKorGpKIiYw9Zc9d8/I=";
+          nativeBuildInputs = [ pkgs.deno pkgs.makeWrapper ];
 
-          dontNpmBuild = true;  # no build script in package.json
+          # Build-time validation: type-check offline against the vendored deps.
+          # A writable DENO_DIR is needed for Deno's transpile cache; the deps
+          # themselves come from vendor/.
+          buildPhase = ''
+            runHook preBuild
+            export DENO_DIR="$TMPDIR/deno-dir"
+            export DENO_NO_UPDATE_CHECK=1
+            # No network in the sandbox; deno resolves deps from vendor/ + the
+            # committed deno.lock. (deno 2.2's `check` has no --cached-only, but
+            # it stays offline because everything it needs is vendored.)
+            deno check index.ts
+            runHook postBuild
+          '';
 
           installPhase = ''
             runHook preInstall
-            mkdir -p $out/lib/counter-inscriptions-backend $out/bin
-            cp -r index.js openapi-spec.yaml node_modules package.json $out/lib/counter-inscriptions-backend/
+            mkdir -p $out/lib/counter-inscriptions-backend
+            cp -r index.ts deno.json deno.lock openapi-spec.yaml vendor \
+              $out/lib/counter-inscriptions-backend/
             # Optional fallback artefact upstream ships.
-            [ -d frontend-build-fallback ] && cp -r frontend-build-fallback $out/lib/counter-inscriptions-backend/ || true
+            [ -d frontend-build-fallback ] && \
+              cp -r frontend-build-fallback $out/lib/counter-inscriptions-backend/ || true
 
-            cat > $out/bin/counter-inscriptions-backend <<EOF
-            #!${pkgs.runtimeShell}
-            exec ${pkgs.nodejs_20}/bin/node $out/lib/counter-inscriptions-backend/index.js "\$@"
-            EOF
-            chmod +x $out/bin/counter-inscriptions-backend
+            # Deno resolves deps from the vendored tree offline (--cached-only);
+            # it still wants a writable DENO_DIR for its transpile cache, so
+            # default one to a private temp dir when the caller sets none.
+            makeWrapper ${pkgs.deno}/bin/deno $out/bin/counter-inscriptions-backend \
+              --run 'export DENO_DIR="''${DENO_DIR:-$(mktemp -d -t ci-deno-XXXXXX)}"' \
+              --set DENO_NO_UPDATE_CHECK 1 \
+              --add-flags "run --cached-only --allow-net --allow-read --allow-env $out/lib/counter-inscriptions-backend/index.ts"
             runHook postInstall
           '';
 
           meta = {
-            description = "Counter-inscriptions Node backend (Express)";
+            description = "Counter-inscriptions Deno backend (Deno.serve)";
             mainProgram = "counter-inscriptions-backend";
           };
         };

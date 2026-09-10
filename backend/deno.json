@@ -1,0 +1,15 @@
+{
+  "name": "counterinscriptions-backend",
+  "version": "1.0.0",
+  "exports": "./index.ts",
+  "imports": {
+    "@std/yaml": "jsr:@std/yaml@^1.0.9",
+    "@std/media-types": "jsr:@std/media-types@^1.1.0",
+    "@std/encoding": "jsr:@std/encoding@^1.0.10",
+    "@std/path": "jsr:@std/path@^1.1.2"
+  },
+  "tasks": {
+    "start": "deno run --allow-net --allow-read --allow-env index.ts"
+  },
+  "vendor": true
+}
