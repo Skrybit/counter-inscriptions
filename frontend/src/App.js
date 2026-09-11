@@ -98,29 +98,58 @@ const S = {
 };
 
 // ─── Wallet helpers ───────────────────────────────────────────────────────────
+//
+// A Counterparty taproot inscription is TWO transactions:
+//   commit — returned as a PSBT; the connected wallet signs and broadcasts it
+//   reveal — already signed by the Counterparty node (ephemeral key); we broadcast it
+//            through the backend right after the commit. Without it nothing is inscribed.
 
-async function signAndBroadcastUnisat(rawTxHex) {
-  // UniSat expects a PSBT for signing; for raw tx we use pushTx/signPsbt
-  // The unsigned tx from Counterparty is a raw PSBT-like hex — use signPsbt
-  try {
-    // Try signPsbt first (newer UniSat API)
-    const signed = await window.unisat.signPsbt(rawTxHex, { autoFinalized: true });
-    const txid = await window.unisat.pushTx(signed);
-    return { txid, method: 'unisat.signPsbt' };
-  } catch {
-    // Fallback: pushTx with raw hex
-    const txid = await window.unisat.pushTx({ rawtx: rawTxHex });
-    return { txid, method: 'unisat.pushTx' };
-  }
+function b64ToHex(b64) {
+  const bin = atob(b64);
+  let hex = '';
+  for (let i = 0; i < bin.length; i++) hex += bin.charCodeAt(i).toString(16).padStart(2, '0');
+  return hex;
 }
 
-async function signAndBroadcastXverse(rawTxHex) {
-  // Xverse uses signPsbt
-  const result = await window.BitcoinProvider.request('signPsbt', {
-    psbt: rawTxHex,
-    broadcast: true,
-  });
-  return { txid: result?.txid || result?.result?.txid, method: 'xverse.signPsbt' };
+async function broadcastViaBackend(apiUrl, signedhex) {
+  const r = await axios.post(`${apiUrl}/broadcast`, { signedhex });
+  return r.data?.txid;
+}
+
+/** Sign `tx.psbt` (base64, from Counterparty verbose compose) with the wallet and broadcast. */
+async function signAndBroadcastCommit(wallet, tx) {
+  if (!tx?.psbt) throw new Error('Backend did not return a PSBT for this transaction');
+  const inputIdx = Array.from({ length: tx.input_count || 1 }, (_, i) => i);
+
+  if (wallet.type === 'UniSat') {
+    const signedHex = await window.unisat.signPsbt(b64ToHex(tx.psbt), {
+      autoFinalized: true,
+      toSignInputs: inputIdx.map(index => ({ index, address: wallet.address })),
+    });
+    const txid = await window.unisat.pushPsbt(signedHex);
+    return { txid, method: 'unisat.signPsbt+pushPsbt' };
+  }
+  if (wallet.type === 'Xverse') {
+    const resp = await window.BitcoinProvider.request('signPsbt', {
+      psbt: tx.psbt,
+      signInputs: { [wallet.address]: inputIdx },
+      broadcast: true,
+    });
+    const txid = resp?.result?.txid || resp?.txid;
+    if (!txid) throw new Error('Xverse did not return a txid (request rejected?)');
+    return { txid, method: 'xverse.signPsbt' };
+  }
+  throw new Error('No supported wallet connected');
+}
+
+/** Commit via wallet, then reveal via backend. */
+async function signAndBroadcastInscription(apiUrl, wallet, tx) {
+  const commit = await signAndBroadcastCommit(wallet, tx);
+  let revealTxid = null;
+  if (tx.signed_reveal_rawtransaction) {
+    revealTxid = await broadcastViaBackend(apiUrl, tx.signed_reveal_rawtransaction);
+  }
+  return { ...commit, revealTxid };
 }
 
 // ─── Main App ─────────────────────────────────────────────────────────────────
@@ -141,6 +170,8 @@ export default function App() {
   const [progress, setProgress] = useState(0);
   const [showMimes, setShowMimes] = useState(false);
   const [health, setHealth] = useState(null);
+  const [batchDrop, setBatchDrop] = useState(null); // { asset, wallets } after a batch issuance is broadcast
+  const [distributing, setDistributing] = useState(false);
 
   // API base follows the Network toggle → the unified UI drives both backends.
   const API_URL = network === 'testnet' ? TESTNET_API : MAINNET_API;
@@ -220,6 +251,7 @@ export default function App() {
     setMinting(true);
     setProgress(10);
     setTxResults([]);
+    setBatchDrop(null);
     setStatus({ type: 'info', msg: 'Building inscription payload...' });
 
     try {
@@ -251,45 +283,51 @@ export default function App() {
       const data = resp.data;
 
       if (mode === 'single') {
-        // Sign each chunk transaction
+        // Sign each chunk: commit in wallet, reveal via backend
         const signed = [];
         for (let i = 0; i < data.transactions.length; i++) {
-          const tx = data.transactions[i];
-          const rawHex = tx.data?.result?.rawtransaction || tx.data?.rawtransaction || tx.data;
+          const item = data.transactions[i];
           setStatus({ type: 'info', msg: `Signing chunk ${i + 1}/${data.transactions.length} in wallet...` });
           setProgress(75 + Math.round((i / data.transactions.length) * 20));
 
           let broadcastResult;
           try {
-            if (wallet.type === 'UniSat') {
-              broadcastResult = await signAndBroadcastUnisat(rawHex);
-            } else if (wallet.type === 'Xverse') {
-              broadcastResult = await signAndBroadcastXverse(rawHex);
-            } else {
-              broadcastResult = { txid: 'manual-broadcast-required', rawTx: rawHex };
-            }
+            broadcastResult = await signAndBroadcastInscription(API_URL, wallet, item.tx);
           } catch (sigErr) {
-            broadcastResult = { error: sigErr.message, rawTx: rawHex };
+            broadcastResult = { error: sigErr.message };
           }
 
           signed.push({
-            asset: tx.asset,
-            chunk: tx.chunk,
-            total: tx.total_chunks,
+            asset: item.asset,
+            chunk: item.chunk,
+            total: item.total_chunks,
+            fee: item.tx?.btc_fee,
             ...broadcastResult,
-            rawTx: rawHex,
+            rawTx: item.tx?.rawtransaction,
           });
         }
 
         setTxResults(signed);
         const ok = signed.filter(s => !s.error).length;
-        setStatus({ type: ok === signed.length ? 'ok' : 'err', msg: `${ok}/${signed.length} chunk(s) signed & broadcast${data.total_chunks > 1 ? ` (${data.total_chunks}-chunk inscription)` : ''}` });
+        const ownerNote = data.owner && data.owner !== data.signer ? ` · ${data.owner} is the asset owner; units stay with your wallet (use Distribute/send to move them)` : '';
+        setStatus({ type: ok === signed.length ? 'ok' : 'err', msg: `${ok}/${signed.length} chunk(s) committed & revealed${data.total_chunks > 1 ? ` (${data.total_chunks}-chunk inscription)` : ''}${ownerNote}` });
 
       } else {
-        // Batch results — raw txs returned, user must broadcast manually or we iterate
-        const results = data.results || [];
-        setTxResults(results);
-        setStatus({ type: 'ok', msg: `${data.succeeded}/${data.total} batch transactions composed. Sign each in your wallet.` });
+        // Batch: ONE issuance of quantity = wallet count, then distribute after confirmation
+        setStatus({ type: 'info', msg: `Signing issuance of ${data.quantity} × ${data.asset} in wallet...` });
+        let broadcastResult;
+        try {
+          broadcastResult = await signAndBroadcastInscription(API_URL, wallet, data.tx);
+        } catch (sigErr) {
+          broadcastResult = { error: sigErr.message };
+        }
+        setTxResults([{ asset: data.asset, fee: data.tx?.btc_fee, ...broadcastResult, rawTx: data.tx?.rawtransaction }]);
+        if (!broadcastResult.error) {
+          setBatchDrop({ asset: data.asset, wallets: data.destinations });
+          setStatus({ type: 'ok', msg: `Issuance broadcast. Once it confirms, click "Distribute" to airdrop 1 × ${data.asset} to ${data.destinations.length} wallets in one transaction.` });
+        } else {
+          setStatus({ type: 'err', msg: `Issuance failed: ${broadcastResult.error}` });
+        }
       }
 
       setProgress(100);
@@ -298,6 +336,31 @@ export default function App() {
       setStatus({ type: 'err', msg: `Mint failed: ${typeof msg === 'object' ? JSON.stringify(msg) : msg}` });
     } finally {
       setMinting(false);
+    }
+  };
+
+  const distribute = async () => {
+    if (!batchDrop || !wallet) return;
+    setDistributing(true);
+    setStatus({ type: 'info', msg: `Composing MPMA send of ${batchDrop.asset} to ${batchDrop.wallets.length} wallets...` });
+    try {
+      const r = await axios.post(`${API_URL}/send-batch`, {
+        walletAddress: wallet.address,
+        asset: batchDrop.asset,
+        destinationWallets: batchDrop.wallets,
+        sat_per_vbyte: feeRate,
+      });
+      setStatus({ type: 'info', msg: 'Signing MPMA send in wallet...' });
+      const result = await signAndBroadcastCommit(wallet, r.data.tx);
+      setTxResults(prev => [...prev, { asset: `${batchDrop.asset} → ${batchDrop.wallets.length} wallets (MPMA)`, fee: r.data.tx?.btc_fee, ...result, rawTx: r.data.tx?.rawtransaction }]);
+      setStatus({ type: 'ok', msg: `Airdrop broadcast: ${result.txid}` });
+      setBatchDrop(null);
+    } catch (err) {
+      const msg = err.response?.data?.error || err.message;
+      const hint = /insufficient|no such asset|not found/i.test(String(msg)) ? ' — the issuance probably has not confirmed yet; wait for a block and retry.' : '';
+      setStatus({ type: 'err', msg: `Distribute failed: ${typeof msg === 'object' ? JSON.stringify(msg) : msg}${hint}` });
+    } finally {
+      setDistributing(false);
     }
   };
 
@@ -494,6 +557,15 @@ export default function App() {
                     <span style={S.mono}>{tx.txid.slice(0, 20)}…</span>
                   </a>
                   <span style={{ fontSize: '0.7rem', color: '#444', marginLeft: '8px' }}>via {tx.method}</span>
+                  {tx.revealTxid && (
+                    <div>
+                      <span style={{ ...S.mono, color: '#7cbc7c' }}>✓ REVEAL: </span>
+                      <a href={`https://mempool.space/tx/${tx.revealTxid}`} target="_blank" rel="noopener noreferrer" style={S.link}>
+                        <span style={S.mono}>{tx.revealTxid.slice(0, 20)}…</span>
+                      </a>
+                    </div>
+                  )}
+                  {tx.fee != null && <span style={{ fontSize: '0.7rem', color: '#444', marginLeft: '8px' }}>commit fee {tx.fee} sat</span>}
                 </div>
               )}
               {tx.error && <div style={{ color: '#f87171', fontSize: '0.8rem' }}>✗ {tx.error}</div>}
@@ -505,11 +577,18 @@ export default function App() {
                   </div>
                 </details>
               )}
-              {/* Batch result fields */}
-              {tx.wallet && <div style={{ ...S.mono, fontSize: '0.75rem', color: '#555', marginTop: '4px' }}>→ {tx.wallet}</div>}
-              {tx.status === 'failed' && <div style={{ color: '#f87171', fontSize: '0.8rem' }}>✗ {tx.error}</div>}
             </div>
           ))}
+          {batchDrop && (
+            <div style={{ marginTop: '8px' }}>
+              <button style={S.btn} onClick={distribute} disabled={distributing}>
+                {distributing ? 'Distributing…' : `Distribute ${batchDrop.asset} to ${batchDrop.wallets.length} wallets`}
+              </button>
+              <div style={{ fontSize: '0.72rem', color: '#555', marginTop: '4px' }}>
+                Wait for the issuance to confirm first — one MPMA send, one signature.
+              </div>
+            </div>
+          )}
         </div>
       )}
 
