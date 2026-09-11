@@ -22,8 +22,12 @@ Taproot inscriptions · UniSat + Xverse wallet support · Batch / airdrop mintin
 │  Backend API (port 3001)            │
 │  Node.js / Express                  │
 │  - POST /api/mint        (single)   │
-│  - POST /api/mint-batch  (airdrop)  │
+│  - POST /api/mint-batch  (airdrop 1)│
+│  - POST /api/send-batch  (airdrop 2)│
+│  - POST /api/broadcast   (reveal)   │
 │  - POST /api/upload      (preflight)│
+│  - GET  /api/asset/:name            │
+│  - GET  /api/tx/:hash               │
 │  - GET  /api/balance/:addr          │
 │  - GET  /api/mime-types             │
 │  - GET  /api/health                 │
@@ -124,60 +128,102 @@ make reset    # down + clean + up
 
 ## Minting Flow
 
+### Commit + reveal (every inscription)
+
+A Counterparty **taproot** inscription is two Bitcoin transactions. The backend asks Counterparty
+to compose with `verbose=true` and returns both in a normalised `tx` object:
+
+| Field | What it is | Who signs / broadcasts |
+|-------|------------|------------------------|
+| `tx.psbt` | Unsigned **commit** as a base64 PSBT | Connected wallet signs and broadcasts |
+| `tx.signed_reveal_rawtransaction` | **Reveal** carrying the ord envelope, already signed by the node with an ephemeral key | Frontend posts it to `POST /api/broadcast` right after the commit |
+
+The inscription content is not on-chain until the reveal confirms. The commit output prefunds the reveal fee,
+so `tx.btc_fee` is the commit fee only.
+
+### Who receives what
+
+Counterparty issuance semantics, which the API follows:
+
+- `walletAddress` (the connected wallet) is the **source**: it signs the commit, pays fees, and receives the
+  issued units and the inscribed sat.
+- `destinationWallet` (optional) becomes the asset **owner** via `transfer_destination`. It does not receive
+  the units. To move units use `/api/send-batch`.
+
 ### Single Mint (with auto-chunking)
 
-Files larger than **350KB binary** are automatically split into multiple Counterparty
-issuances. The frontend signs each chunk sequentially.
-
 ```
-File → detect MIME → chunk(350KB) → per-chunk POST /api/mint
-     → composeIssuance() → sign PSBT in wallet → broadcast
+File → detect MIME → chunk(350KB) → POST /api/mint
+     → per chunk: compose issuance (verbose) → sign PSBT in wallet → broadcast commit
+                                              → POST /api/broadcast (reveal)
 ```
 
-Chunks are named `ASSET_1`, `ASSET_2`, etc. Reassembly is handled at the application/viewer layer.
+Files larger than **350KB binary** are split into multiple issuances. Chunk asset names must be valid
+Counterparty names, so chunks use **consecutive numeric assets**: `A<n>`, `A<n+1>`, `A<n+2>` …
+Named assets (`MYTOKEN`) cannot be chunked; the API returns 400 and tells you to use a numeric name.
+Reassembly is handled at the application/viewer layer.
 
-### Batch Mint (airdrop)
+The backend checks every chunk name against `GET /v2/assets/<asset>` before composing and returns 409 if
+one already exists.
 
-One file minted to many destination wallets. File must be **≤350KB** (single chunk).
-Use single mint with chunking for larger files.
+### Batch Mint (airdrop) — two steps, two signatures
 
 ```
-File → hex → loop(wallets) → POST /api/mint-batch
-     → unsigned txs returned → sign + broadcast per wallet
+Step 1  File → POST /api/mint-batch   → ONE issuance, quantity = number of wallets
+                                       → sign commit + broadcast reveal (same as single)
+        …wait for the issuance to confirm…
+Step 2  POST /api/send-batch           → ONE MPMA send: 1 unit to each wallet
+                                       → sign PSBT in wallet ("Distribute" button in the UI)
 ```
+
+File must be **≤350KB**.
 
 ---
 
 ## API Reference
 
-Full interactive docs at `http://localhost:3001/swagger-ui.html`.
+Full interactive docs at `http://localhost:3001/swagger-ui.html` (spec in `backend/openapi-spec.yaml`).
 
 ### `POST /api/mint`
-Single file → one wallet. Accepts `multipart/form-data`.
+Single file → issuance(s) signed by the connected wallet. Accepts `multipart/form-data`.
 
 | Field | Required | Description |
 |-------|----------|-------------|
 | `file` | yes | File to inscribe (max 50MB) |
-| `asset` | yes | Asset name e.g. `MYTOKEN` or `A17...` |
-| `walletAddress` | yes | Connected wallet (fee payer) |
-| `destinationWallet` | no | Recipient address (defaults to `walletAddress`) |
+| `asset` | yes | `A` + 17–20 digits (free) or 4–12 uppercase letters not starting with `A` (0.5 XCP) |
+| `walletAddress` | yes | Connected wallet: signs, pays fees, receives units + inscribed sat |
+| `destinationWallet` | no | Becomes asset owner (`transfer_destination`). Does not receive units |
 | `mime_type` | no | Override auto-detected MIME type |
+| `quantity` | no | Units to issue (default `1`) |
 | `sat_per_vbyte` | no | Fee rate (default: `2.01`) |
 | `encoding` | no | `taproot` (default) |
 
-Returns chunk-by-chunk transaction data for wallet signing.
+Returns `transactions[]`, one per chunk, each with `asset`, `chunk`, `total_chunks` and a `tx` bundle
+(`psbt`, `rawtransaction`, `signed_reveal_rawtransaction`, `envelope_script`, `input_count`, `btc_fee`, …).
+
+Errors: `400` invalid name / named asset needing chunks, `402` insufficient funds, `409` asset exists,
+`422` unsupported MIME, `503` Counterparty unreachable.
 
 ### `POST /api/mint-batch`
-One file → many wallets. Same fields as `/api/mint` plus:
+Airdrop step 1. Same fields as `/api/mint` plus `destinationWallets` (comma-separated). Composes **one**
+issuance with `quantity` = number of distinct wallets. Returns a single `tx` bundle. File must be ≤350KB.
 
-| Field | Required | Description |
-|-------|----------|-------------|
-| `destinationWallets` | yes | Comma-separated wallet addresses |
+### `POST /api/send-batch`
+Airdrop step 2. JSON or form: `walletAddress`, `asset`, `destinationWallets` (array or comma-separated),
+optional `quantity_each`, `sat_per_vbyte`. Composes one MPMA send and returns a `tx` bundle (no reveal).
+Fails with 402 until the issuance has confirmed.
 
-File must be ≤350KB. Returns per-wallet success/failure results.
+### `POST /api/broadcast`
+`{ "signedhex": "<hex>" }` → proxies to Counterparty `sendrawtransaction`. Used for the reveal.
+
+### `GET /api/asset/:name`
+`{ valid, available, existing }` — validity per Counterparty naming rules and whether it already exists.
+
+### `GET /api/tx/:hash`
+Counterparty's record of a transaction (`result: null` until parsed).
 
 ### `POST /api/upload`
-Pre-flight analysis — no minting. Returns MIME type, size, chunk count, and hex preview. Use this before minting to confirm chunk count.
+Pre-flight analysis — no minting. Returns MIME type, size, chunk count, and hex preview.
 
 ### `GET /api/balance/:address`
 Proxies to Counterparty `/v2/addresses/:address/balances`.
@@ -192,13 +238,18 @@ Full list of supported MIME types, max chunk size, and max file size.
 
 ## Wallet Signing
 
+Both wallets sign the base64 PSBT that Counterparty returns; neither can sign a raw unsigned transaction.
+
 ### UniSat
-Uses `signPsbt` on the unsigned PSBT returned by Counterparty, then `pushTx` to broadcast.
+PSBT is converted base64 → hex, signed with `signPsbt(hex, { autoFinalized: true, toSignInputs })`, and
+broadcast with `pushPsbt`. The reveal goes through `POST /api/broadcast`.
 
 ### Xverse
-Uses `signPsbt` with `broadcast: true` — Xverse handles broadcasting internally.
+`signPsbt` with the base64 PSBT, `signInputs: { [address]: [0..n-1] }` (n = `tx.input_count`) and
+`broadcast: true`. The reveal goes through `POST /api/broadcast`.
 
-Both wallets support Testnet/Mainnet toggle from the UI. Switching networks in the UI also switches the active UniSat network.
+Both wallets support Testnet/Mainnet toggle from the UI. Switching networks in the UI also switches the
+active UniSat network. The backend points at a single `COUNTERPARTY_URL`; run one stack per network.
 
 ---
 
@@ -296,7 +347,9 @@ The patched image is built via `xcp-api-mime-Dockerfile` with the repo root as t
 
 ## Limitations
 
-- **Chunk reassembly** is handled at the application layer — viewers must know to combine `ASSET_1` + `ASSET_2` etc.
-- **Batch mint** requires files ≤350KB. Use single mint with auto-chunking for larger files.
+- **Chunk reassembly** is handled at the application layer — viewers must know to combine `A<n>`, `A<n+1>`, … in order.
+- **Chunked files need a numeric asset name**; named assets cannot be chunked.
+- **Batch mint** requires files ≤350KB and two signatures (issuance, then MPMA send after confirmation).
+- **UTXO contention**: several composes from one wallet in a row (chunks) rely on Counterparty's short-lived UTXO locks; a wallet with a single UTXO can only fund the first one until it confirms.
 - **Wallet signing** requires the UniSat or Xverse browser extension.
-- **Counterparty runs in api-only mode** — no Bitcoin Core node is required for composing inscriptions.
+- **Counterparty still needs a Bitcoin backend for UTXOs in api-only mode** — `config/server.conf` points `backend-connect` at a public RPC by default; run your own node for anything beyond testing.
