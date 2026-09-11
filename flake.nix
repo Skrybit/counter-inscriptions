@@ -1,19 +1,18 @@
 {
-  description = "Counter-Inscriptions — Counterparty MIME-inscription stack (Node API + React UI + cp-server)";
+  description = "Counter-Inscriptions — Counterparty MIME-inscription stack (Deno API + React UI)";
 
+  # The patched counterparty-server (extra MIME types, 50 MB body limit) is NOT
+  # built here: the fleet deploys cp-server from Skrybit/bitcoin-infrastructure
+  # (upstream CounterpartyXCP + patches), and this repo's fleet-consumed outputs
+  # are the backend + frontend only. Local docker-compose uses the cp-server
+  # image directly. (INFRA-292: dropped the counterparty-core input after the
+  # Skrybit/counterparty-core fork was retired.)
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.05";
     flake-utils.url = "github:numtide/flake-utils";
-
-    # The patched counterparty-server (extra MIME types, 50 MB body limit).
-    # During local development, override on the command line with:
-    #   nix build --override-input counterparty-core path:../counterparty-core
-    counterparty-core.url = "github:Skrybit/counterparty-core/nightly";
-    counterparty-core.inputs.nixpkgs.follows = "nixpkgs";
-    counterparty-core.inputs.flake-utils.follows = "flake-utils";
   };
 
-  outputs = { self, nixpkgs, flake-utils, counterparty-core }:
+  outputs = { self, nixpkgs, flake-utils }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
@@ -23,7 +22,7 @@
         # + fetch + @std). Dependencies are the jsr @std libs only, vendored
         # under backend/vendor/ and pinned in deno.lock — so both the build and
         # the runtime resolve fully offline (no npmDepsHash, no network, no
-        # node_modules). cp-server dependency is unaffected.
+        # node_modules).
         backend = pkgs.stdenvNoCC.mkDerivation {
           pname = "counter-inscriptions-backend";
           version = "1.0.0";
@@ -105,27 +104,19 @@
           meta.description = "Counter-inscriptions React frontend (static build)";
         };
 
-        # ── Counterparty server (re-exported from the input flake) ──
-        # The build-time patches (extra MIME types, 50 MB body/form limits)
-        # live in the counterparty-core fork; we just point at the artifact.
-        counterparty-server = counterparty-core.packages.${system}.default;
       in
       {
         packages = {
-          inherit backend frontend counterparty-server;
-          # `default` = the binary you'd most want to test in a shell. The
-          # other two are libraries-shaped outputs (Node runtime / static
-          # bundle), useful from NixOS modules but less useful as `nix run`.
-          default = counterparty-server;
+          inherit backend frontend;
+          # `default` = the runnable Deno backend (the one worth `nix run`-ing
+          # in a shell); `frontend` is a static-bundle output for NixOS modules.
+          default = backend;
         };
 
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [
-            nodejs_20
-            # Match the cp-server flake's dev tooling.
-            python313
-            rustc
-            cargo
+            nodejs_20 # frontend (react-scripts)
+            deno # backend (Deno.serve)
           ];
         };
       }
